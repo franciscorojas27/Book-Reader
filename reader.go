@@ -89,24 +89,16 @@ func extractPageText(pg pdf.Page) (string, error) {
 func rowsToText(rows pdf.Rows) string {
 	var b strings.Builder
 	for i, row := range rows {
-		var prevChunk string
+		toks := make([]string, 0, len(row.Content))
 		for _, word := range row.Content {
 			chunk := strings.TrimSpace(word.S)
 			if chunk == "" {
 				continue
 			}
-			// Insert a space when previous chunk ends with letter/digit
-			// and current chunk starts with letter/digit. This keeps words
-			// separate while avoiding layout-width heuristics.
-			if prevChunk != "" {
-				last := []rune(prevChunk)[len([]rune(prevChunk))-1]
-				first := []rune(chunk)[0]
-				if (unicode.IsLetter(last) || unicode.IsDigit(last)) && (unicode.IsLetter(first) || unicode.IsDigit(first)) {
-					b.WriteByte(' ')
-				}
-			}
-			b.WriteString(chunk)
-			prevChunk = chunk
+			toks = append(toks, chunk)
+		}
+		if len(toks) > 0 {
+			b.WriteString(strings.Join(toks, " "))
 		}
 		if i < len(rows)-1 {
 			b.WriteByte('\n')
@@ -329,14 +321,8 @@ func contentToText(pg pdf.Page) string {
 			// Do not insert spaces based on gap heuristics; just append.
 			chunk := strings.TrimSpace(txt.S)
 			if chunk != "" {
-				// If previous chunk ends with letter/digit and current
-				// starts with letter/digit, insert a space.
 				if prevChunk != "" {
-					last := []rune(prevChunk)[len([]rune(prevChunk))-1]
-					first := []rune(chunk)[0]
-					if (unicode.IsLetter(last) || unicode.IsDigit(last)) && (unicode.IsLetter(first) || unicode.IsDigit(first)) {
-						b.WriteByte(' ')
-					}
+					b.WriteByte(' ')
 				}
 				b.WriteString(chunk)
 				prevChunk = chunk
