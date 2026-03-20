@@ -9,7 +9,6 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"unicode"
 )
 
 const (
@@ -27,7 +26,7 @@ var (
 
 type pdfModel struct {
 	path          string
-	pages         []string
+	cache         *pageCache
 	viewport      viewport.Model
 	currentPage   int
 	totalPages    int
@@ -42,14 +41,14 @@ type pdfModel struct {
 	searchTerm    string
 }
 
-func newPDFModel(path string, pages []string) pdfModel {
+func newPDFModel(path string, cache *pageCache) pdfModel {
 	vp := viewport.New(80, 20)
 	model := pdfModel{
 		path:          path,
-		pages:         pages,
+		cache:         cache,
 		viewport:      vp,
 		currentPage:   1,
-		totalPages:    len(pages),
+		totalPages:    cache.total,
 		mode:          "NORMAL",
 		statusMessage: "Press : for commands, / to search",
 		helpMessage:   "help | goto <n> | search <term> | export",
@@ -145,7 +144,7 @@ func (m *pdfModel) processCommand(input string) {
 			return
 		}
 		m.searchTerm = term
-		m.matches = findMatches(m.pages, term)
+		m.matches = m.findMatches(term)
 		if len(m.matches) == 0 {
 			m.statusMessage = fmt.Sprintf("No matches for %s", term)
 			return
@@ -181,12 +180,13 @@ func (m *pdfModel) gotoPageFromCmd(input string) {
 }
 
 func (m *pdfModel) exportPage() {
-	if len(m.pages) == 0 || m.currentPage < 1 || m.currentPage > len(m.pages) {
+	if m.currentPage < 1 || m.currentPage > m.totalPages {
 		m.statusMessage = "No page available to export"
 		return
 	}
+	content := m.cache.get(m.currentPage)
 	file := fmt.Sprintf("export_page_%d.txt", m.currentPage)
-	if err := os.WriteFile(file, []byte(m.pages[m.currentPage-1]), 0o644); err != nil {
+	if err := os.WriteFile(file, []byte(content), 0o644); err != nil {
 		m.statusMessage = fmt.Sprintf("export failed: %v", err)
 		return
 	}
@@ -209,9 +209,17 @@ func (m *pdfModel) handleNavigation(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "k", "up":
 		m.viewport.LineUp(1)
 	case "J", " ", "pgdn", "pgdown", "pagedown", "ctrl+f":
-		m.nextPage()
+		if m.viewport.AtBottom() {
+			m.nextPage()
+		} else {
+			m.viewport.LineDown(m.viewport.Height - 1)
+		}
 	case "K", "pgup", "pageup", "repg", "ctrl+b":
-		m.prevPage()
+		if m.viewport.AtTop() {
+			m.prevPage()
+		} else {
+			m.viewport.LineUp(m.viewport.Height - 1)
+		}
 	case ":":
 		m.commandMode = true
 		m.showHelp = false
@@ -263,6 +271,10 @@ func (m *pdfModel) prevPage() {
 	m.statusMessage = fmt.Sprintf("Page %d/%d", m.currentPage, m.totalPages)
 }
 
+/*
+nextMatch sequentially rotates the document cursor to the subsequent
+searched target found dynamically across the cached memory.
+*/
 func (m *pdfModel) nextMatch() {
 	if len(m.matches) == 0 {
 		m.statusMessage = "No active search"
@@ -287,24 +299,34 @@ func (m *pdfModel) prevMatch() {
 	m.statusMessage = fmt.Sprintf("Match %d/%d", m.matchIndex+1, len(m.matches))
 }
 
+/*
+refreshPage pulls the resolved textual data for the actively focused page
+and synchronously mounts it into the terminal viewport bounds. 
+It optionally injects dynamic highlights for active searches and invokes
+the line-wrapping sub-routine to preserve readability margins.
+*/
 func (m *pdfModel) refreshPage() {
-	if len(m.pages) == 0 {
+	if m.totalPages == 0 {
 		m.viewport.SetContent("(no pages loaded)")
 		return
 	}
 	if m.currentPage < 1 {
 		m.currentPage = 1
 	}
-	if m.currentPage > len(m.pages) {
-		m.currentPage = len(m.pages)
+	if m.currentPage > m.totalPages {
+		m.currentPage = m.totalPages
 	}
-	content := m.pages[m.currentPage-1]
+	content := m.cache.get(m.currentPage)
+	/*
+	   Background pre-fetching buffer.
+	   Triggering preloadAround ensures seamless reading transitions 
+	   by mounting surrounding pages into the thread-safe map preemptively.
+	*/
+	m.cache.preloadAround(m.currentPage, 3)
+
 	if m.searchTerm != "" {
 		content = highlightText(content, m.searchTerm)
 	}
-	// Wrap content to viewport width so long lines get broken into
-	// readable rows. Use a conservative max width to account for
-	// viewport padding and borders.
 	wrapWidth := m.viewport.Width - 4
 	if wrapWidth < 20 {
 		wrapWidth = m.viewport.Width
@@ -315,51 +337,81 @@ func (m *pdfModel) refreshPage() {
 	m.viewport.SetContent(content)
 }
 
-// wrapText splits text into lines no longer than maxWidth. It preserves
-// existing newlines and tries to break at spaces when possible; if a token
-// has no spaces and exceeds maxWidth, it is hard-wrapped.
+/*
+wrapText applies word wrapping to ensure the extracted PDF paragraph fits seamlessly
+within the boundaries of the terminal viewport.
+It performs a hard wrap on maxWidth boundaries, and fully justifies the lines 
+by inserting mathematically distributed padding spaces between words. 
+The final line of any paragraph natively retains its standard left alignment.
+*/
 func wrapText(s string, maxWidth int) string {
 	if s == "" || maxWidth <= 0 {
 		return s
 	}
+
 	var out []string
-	for _, line := range strings.Split(s, "\n") {
-		rline := []rune(line)
-		if len(rline) == 0 {
+	paragraphs := strings.Split(s, "\n")
+	
+	for _, p := range paragraphs {
+		p = strings.TrimSpace(p)
+		if p == "" {
 			out = append(out, "")
 			continue
 		}
-		for len(rline) > 0 {
-			if len(rline) <= maxWidth {
-				out = append(out, string(rline))
-				break
+
+		words := strings.Fields(p)
+		var currentLine []string
+		var currentLineLen int
+
+		for _, word := range words {
+			wordLen := len([]rune(word))
+			
+			if len(currentLine) > 0 && currentLineLen+len(currentLine)+wordLen > maxWidth {
+				out = append(out, justifyLine(currentLine, currentLineLen, maxWidth))
+				currentLine = []string{word}
+				currentLineLen = wordLen
+			} else {
+				currentLine = append(currentLine, word)
+				currentLineLen += wordLen
 			}
-			// look for last space within maxWidth
-			cut := maxWidth
-			found := -1
-			for i := 0; i < maxWidth; i++ {
-				if unicode.IsSpace(rline[i]) {
-					found = i
-				}
-			}
-			if found > 0 {
-				// break at found (skip trailing spaces)
-				part := strings.TrimRight(string(rline[:found]), " \t")
-				out = append(out, part)
-				// skip spaces after
-				j := found
-				for j < len(rline) && unicode.IsSpace(rline[j]) {
-					j++
-				}
-				rline = rline[j:]
-				continue
-			}
-			// no space found: hard wrap
-			out = append(out, string(rline[:cut]))
-			rline = rline[cut:]
+		}
+
+		if len(currentLine) > 0 {
+			out = append(out, strings.Join(currentLine, " "))
 		}
 	}
+
 	return strings.Join(out, "\n")
+}
+
+/*
+justifyLine computes the exact gap frequency required to distribute excess 
+blank columns smoothly across the line, producing a perfectly flush right margin.
+*/
+func justifyLine(words []string, wordsLen int, maxWidth int) string {
+	if len(words) == 1 {
+		return words[0]
+	}
+
+	totalSpaces := maxWidth - wordsLen
+	gaps := len(words) - 1
+
+	spacesPerGap := totalSpaces / gaps
+	extraSpaces := totalSpaces % gaps
+
+	var builder strings.Builder
+	for i, word := range words {
+		builder.WriteString(word)
+		if i < gaps {
+			spacesToApply := spacesPerGap
+			if i < extraSpaces {
+				spacesToApply++
+			}
+			builder.WriteString(strings.Repeat(" ", spacesToApply))
+		}
+	}
+
+	return builder.String()
 }
 
 func (m pdfModel) View() string {
@@ -411,12 +463,17 @@ func shortenPath(path string, max int) string {
 	return "..." + path[len(path)-max+3:]
 }
 
-func findMatches(pages []string, term string) []int {
+/*
+findMatches executes a lazy-loaded linear scan over all strictly indexed 
+document pages to isolate sub-string hits.
+*/
+func (m *pdfModel) findMatches(term string) []int {
 	lowerTerm := strings.ToLower(term)
-	matches := make([]int, 0)
-	for idx, page := range pages {
-		if strings.Contains(strings.ToLower(page), lowerTerm) {
-			matches = append(matches, idx+1)
+	var matches []int
+	for i := 1; i <= m.totalPages; i++ {
+		pageText := m.cache.get(i)
+		if strings.Contains(strings.ToLower(pageText), lowerTerm) {
+			matches = append(matches, i)
 		}
 	}
 	return matches

@@ -14,13 +14,13 @@ func main() {
 	}
 
 	path := os.Args[1]
-	pages, err := loadPages(path)
+	cache, err := loadPages(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening PDF: %v\n", err)
 		os.Exit(1)
 	}
 
-	program := tea.NewProgram(newPDFModel(path, pages), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	program := tea.NewProgram(newPDFModel(path, cache), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if err := program.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Runtime error: %v\n", err)
 		os.Exit(1)

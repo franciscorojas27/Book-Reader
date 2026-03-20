@@ -4,152 +4,230 @@ import (
 	"fmt"
 	"math"
 	"regexp"
-	"sort"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/dslipak/pdf"
 )
 
-func loadPages(path string) ([]string, error) {
+/*
+pageCache holds lazily-loaded page text to guarantee the application 
+starts instantly without fully mounting the PDF upfront into memory.
+*/
+type pageCache struct {
+	mu     sync.Mutex
+	reader *pdf.Reader
+	total  int
+	cache  map[int]string
+}
+
+func newPageCache(r *pdf.Reader) *pageCache {
+	return &pageCache{
+		reader: r,
+		total:  r.NumPage(),
+		cache:  make(map[int]string),
+	}
+}
+
+/*
+get returns the text layout string for page i (1-indexed).
+It locks around the hashmap to concurrently serve pages.
+*/
+func (pc *pageCache) get(i int) string {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	if text, ok := pc.cache[i]; ok {
+		return text
+	}
+	pg := pc.reader.Page(i)
+	if pg.V.IsNull() {
+		pc.cache[i] = ""
+		return ""
+	}
+	txt, err := extractPageText(pg)
+	if err != nil {
+		txt = fmt.Sprintf("Error reading page %d: %v", i, err)
+	}
+	pc.cache[i] = txt
+	return txt
+}
+
+/*
+preloadAround automatically spins up headless goroutines 
+to pre-mount adjacent pages while the user is reading.
+*/
+func (pc *pageCache) preloadAround(current, radius int) {
+	for delta := 1; delta <= radius; delta++ {
+		for _, candidate := range []int{current + delta, current - delta} {
+			if candidate < 1 || candidate > pc.total {
+				continue
+			}
+			pc.mu.Lock()
+			_, loaded := pc.cache[candidate]
+			pc.mu.Unlock()
+			if !loaded {
+				go func(idx int) {
+					_ = pc.get(idx)
+				}(candidate)
+			}
+		}
+	}
+}
+
+/*
+loadPages serves as the entry ingestion method. It builds the 
+pointer maps but delays text processing entirely to the cache.
+*/
+func loadPages(path string) (*pageCache, error) {
 	r, err := pdf.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	total := r.NumPage()
-	pages := make([]string, total)
-	for i := 1; i <= total; i++ {
-		pg := r.Page(i)
-		if pg.V.IsNull() {
-			pages[i-1] = ""
-			continue
-		}
-		txt, err := extractPageText(pg)
-		if err != nil {
-			pages[i-1] = fmt.Sprintf("Error reading page %d: %v", i, err)
-			continue
-		}
-		pages[i-1] = txt
-	}
-	return pages, nil
+	return newPageCache(r), nil
 }
 
+/*
+extractPageText is the core text alignment engine.
+It intercepts the raw PDF binary array (Contents) and builds the string stream manually. 
+This bypasses dslipak/pdf's unreliable threshold gaps. 
+Instead of calculating font metric ranges, this tracks native line-breaks (Td, Tm) 
+to inject hard splits when words wrap naturally down the page.
+*/
 func extractPageText(pg pdf.Page) (string, error) {
-	plainText, plainErr := pg.GetPlainText(nil)
-	plainText = sanitizeExtractedText(plainText)
-	// If plain extracted text is available, prefer it — it's usually
-	// the cleanest representation and avoids fragile spacing heuristics.
-	if strings.TrimSpace(plainText) != "" {
-		// If plainText contains multiple short lines, it's probably well-formed
-		// and we can return it directly. If it's a single very long line
-		// (common with some PDFs), prefer row/content extraction instead.
-		nl := strings.Count(plainText, "\n")
-		if nl >= 1 {
-			lines := strings.Split(plainText, "\n")
-			total := 0
-			for _, l := range lines {
-				total += len(strings.TrimSpace(l))
-			}
-			avg := 0
-			if len(lines) > 0 {
-				avg = total / len(lines)
-			}
-			if avg < 200 {
-				return plainText, nil
-			}
-		}
-		// otherwise fall through and choose best among row/content
+	strm := pg.V.Key("Contents")
+
+	fonts := make(map[string]*pdf.Font)
+	for _, fontName := range pg.Fonts() {
+		f := pg.Font(fontName)
+		fonts[fontName] = &f
 	}
 
-	rowText := ""
-	rows, rowsErr := pg.GetTextByRow()
-	if rowsErr == nil {
-		rowText = sanitizeExtractedText(rowsToText(rows))
-	}
-
-	contentText := sanitizeExtractedText(contentToText(pg))
-
-	best := chooseBestPageText(plainText, rowText, contentText)
-	// Apply a simple, pattern-based cleanup: collapse long runs of single
-	// letters separated by spaces (e.g. "F o r m a n y" -> "Formany"),
-	// remove spaces before punctuation and ensure one space after.
-	best = simpleFixSpaces(best)
-	if strings.TrimSpace(best) != "" {
-		return best, nil
-	}
-	if plainErr != nil {
-		return "", plainErr
-	}
-	if rowsErr != nil {
-		return "", rowsErr
-	}
-	return "", nil
-}
-
-func rowsToText(rows pdf.Rows) string {
 	var b strings.Builder
-	for i, row := range rows {
-		for _, word := range row.Content {
-			// Do not insert spaces based on gap heuristics; simply
-			// concatenate tokens. We'll apply simple punctuation-based
-			// spacing later to ensure commas/periods are followed by a space.
-			chunk := strings.TrimSpace(word.S)
-			if chunk == "" {
-				continue
+	var enc pdf.TextEncoding
+
+	showText := func(s string) {
+		if enc != nil {
+			for _, ch := range enc.Decode(s) {
+				b.WriteRune(ch)
 			}
-			b.WriteString(chunk)
+		} else {
+			b.WriteString(s)
 		}
-		if i < len(rows)-1 {
+	}
+
+	var err error
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("pdf interpretation panic: %v", r)
+		}
+	}()
+
+	var lastY float64 = -9999
+
+	pdf.Interpret(strm, func(stk *pdf.Stack, op string) {
+		n := stk.Len()
+		args := make([]pdf.Value, n)
+		for i := n - 1; i >= 0; i-- {
+			args[i] = stk.Pop()
+		}
+
+		switch op {
+		case "T*":
 			b.WriteByte('\n')
+		case "Tf":
+			if len(args) == 2 {
+				f := args[0].Name()
+				if font, ok := fonts[f]; ok {
+					enc = font.Encoder()
+				} else {
+					enc = nil
+				}
+			}
+		case "\"":
+			if len(args) == 3 {
+				b.WriteByte('\n')
+				showText(args[2].RawString())
+			}
+		case "'":
+			if len(args) == 1 {
+				b.WriteByte('\n')
+				showText(args[0].RawString())
+			}
+		case "Td", "TD":
+			/*
+			   Td/TD: Relative position translation operations.
+			   By calculating if the vertical shift (ty) is strictly larger than 1.0, 
+			   we intercept implicit line breaks and forcibly split the bounding text.
+			*/
+			if len(args) == 2 {
+				ty := args[1].Float64()
+				if math.Abs(ty) > 1.0 {
+					b.WriteByte('\n')
+				}
+			}
+		case "Tm":
+			/*
+			   Tm: Absolute matrix translation overrides.
+			   Acts exactly as Td, but locks onto absolute offsets. Significant shifting
+			   likewise implies a physical line flush.
+			*/
+			if len(args) == 6 {
+				ty := args[5].Float64()
+				if lastY != -9999 && math.Abs(ty-lastY) > 1.0 {
+					b.WriteByte('\n')
+				}
+				lastY = ty
+			}
+		case "Tj":
+			if len(args) == 1 {
+				showText(args[0].RawString())
+			}
+		case "TJ":
+			if len(args) > 0 {
+				v := args[0]
+				for i := 0; i < v.Len(); i++ {
+					x := v.Index(i)
+					if x.Kind() == pdf.String {
+						showText(x.RawString())
+					}
+				}
+			}
 		}
+	})
+
+	if err != nil {
+		return "", err
 	}
-	return b.String()
+
+	text := b.String()
+	text = sanitizeExtractedText(text)
+
+	/*
+	   NLP Post-Processing
+	   Despite tracking direct physical coordinates, some PDFs encode native
+	   missing spaces in formatting elements missing tracking boundaries.
+	   Conservatively slicing boundaries like numbers and hyphenations preserves
+	   the aesthetic flow natively.
+	*/
+	reHyphen := regexp.MustCompile(`([a-z]+)-\n([a-z]+)`)
+	text = reHyphen.ReplaceAllString(text, "$1$2\n")
+
+	reCamel := regexp.MustCompile(`([a-z])([A-Z])`)
+	text = reCamel.ReplaceAllString(text, "$1 $2")
+
+	reLetterNum := regexp.MustCompile(`([a-zA-Z])([0-9])`)
+	text = reLetterNum.ReplaceAllString(text, "$1 $2")
+	
+	reNumLetter := regexp.MustCompile(`([0-9])([a-zA-Z])`)
+	text = reNumLetter.ReplaceAllString(text, "$1 $2")
+
+	text = simpleFixSpaces(text)
+
+	return text, nil
 }
 
-func chooseBestPageText(options ...string) string {
-	best := ""
-	bestScore := -1 << 30
-	for _, option := range options {
-		score := pageTextScore(option)
-		if score > bestScore {
-			best = option
-			bestScore = score
-		}
-	}
-	return best
-}
 
-func pageTextScore(s string) int {
-	trimmed := strings.TrimSpace(s)
-	if trimmed == "" {
-		return -1 << 29
-	}
-	words := strings.Fields(trimmed)
-	wordCount := len(words)
-	if wordCount == 0 {
-		return -1 << 29
-	}
-
-	runeCount := len([]rune(trimmed))
-	newlines := strings.Count(trimmed, "\n")
-	replacements := strings.Count(trimmed, "\uFFFD")
-
-	singleLetter := 0
-	for _, w := range words {
-		r := []rune(w)
-		if len(r) == 1 && unicode.IsLetter(r[0]) {
-			singleLetter++
-		}
-	}
-
-	// Penalize heavily broken outputs that are mostly one-letter tokens.
-	penalty := 0
-	if wordCount >= 20 && singleLetter*100/wordCount >= 35 {
-		penalty = 250
-	}
-
-	return runeCount + (wordCount * 3) + (newlines * 5) - (replacements * 40) - penalty
-}
 
 func sanitizeExtractedText(s string) string {
 	if s == "" {
@@ -169,82 +247,19 @@ func sanitizeExtractedText(s string) string {
 	return b.String()
 }
 
-// collapseSpacedLetters joins sequences of single-letter tokens that likely
-// represent a word split into separate glyphs (e.g., "F o r").
-func collapseSpacedLetters(text string) string {
-	if text == "" {
-		return ""
-	}
-	var b strings.Builder
-	lines := strings.Split(text, "\n")
-	for li, line := range lines {
-		if li > 0 {
-			b.WriteByte('\n')
-		}
-		tokens := strings.Fields(line)
-		if len(tokens) == 0 {
-			continue
-		}
-		merged := make([]string, 0, len(tokens))
-		for i := 0; i < len(tokens); {
-			// Only aggressively merge runs of single-letter tokens
-			// (e.g., "F o r"). This avoids joining short real words.
-			if tokenIsLetters(tokens[i]) && len([]rune(tokens[i])) == 1 {
-				j := i
-				var runes []rune
-				for j < len(tokens) {
-					r := []rune(tokens[j])
-					if len(r) == 1 && tokenIsLetters(tokens[j]) {
-						runes = append(runes, r[0])
-						j++
-						continue
-					}
-					break
-				}
-				if j-i >= 3 {
-					merged = append(merged, string(runes))
-					i = j
-					continue
-				}
-			}
-			merged = append(merged, tokens[i])
-			i++
-		}
-		for ti, tok := range merged {
-			if ti > 0 {
-				b.WriteByte(' ')
-			}
-			b.WriteString(tok)
-		}
-	}
-	return b.String()
-}
 
-func tokenIsLetters(token string) bool {
-	if token == "" {
-		return false
-	}
-	for _, r := range token {
-		if !unicode.IsLetter(r) {
-			return false
-		}
-	}
-	return true
-}
 
-// simpleFixSpaces applies a small set of deterministic regex rules to
-// (1) collapse obvious glyph-split runs like "F o r m a n y" -> "Formany",
-// (2) remove spaces before punctuation, and
-// (3) ensure exactly one space after punctuation.
+// simpleFixSpaces applies a small set of deterministic regex rules to clean up
+// common PDF extraction artifacts.
 func simpleFixSpaces(s string) string {
 	if strings.TrimSpace(s) == "" {
 		return s
 	}
-	// Collapse runs of single-letter tokens: (?:L\s+){3,}L
-	reRun := regexp.MustCompile(`(?i)(?:([A-Za-z])\s+){3,}([A-Za-z])`)
-	// Use ReplaceAllStringFunc to remove spaces inside each matched run.
-	s = reRun.ReplaceAllStringFunc(s, func(m string) string {
-		// remove all spaces inside the match
+
+	// Collapse runs of 3 or more single letters (e.g. "T a l e n t").
+	// Using 3+ letters is much safer to avoid squashing valid single-letter words.
+	reSpaced := regexp.MustCompile(`(?i)(?:\b[A-Za-z]\s+){2,}[A-Za-z]\b`)
+	s = reSpaced.ReplaceAllStringFunc(s, func(m string) string {
 		return strings.ReplaceAll(m, " ", "")
 	})
 
@@ -252,7 +267,7 @@ func simpleFixSpaces(s string) string {
 	reBefore := regexp.MustCompile(`\s+([,.;:!?])`)
 	s = reBefore.ReplaceAllString(s, "$1")
 
-	// Ensure one space after punctuation if it's immediately followed by a letter/number
+	// Ensure one space after punctuation if immediately followed by a letter/number
 	reAfter := regexp.MustCompile(`([,.;:!?])(\S)`)
 	s = reAfter.ReplaceAllString(s, "$1 $2")
 
@@ -268,61 +283,4 @@ func simpleFixSpaces(s string) string {
 	return strings.Join(lines, "\n")
 }
 
-// gapNeedsSpace decides whether a horizontal gap between two text chunks
-// should be treated as a word space. It uses token lengths and average
-// character widths to avoid inserting spaces between individual letters
-// that PDF text extraction sometimes emits as separate tokens.
-func gapNeedsSpace(prevS string, prevW, currW, gap float64, currS string) bool {
-	// Simplified spacing heuristic: use a fixed absolute threshold.
-	// Avoids complex width-based heuristics that can introduce spurious
-	// spaces between glyph fragments. Treat as a word-space only when the
-	// horizontal gap is clearly large.
-	const spaceThreshold = 2.2
-	return gap > spaceThreshold
-}
 
-func contentToText(pg pdf.Page) string {
-	content := pg.Content()
-	if len(content.Text) == 0 {
-		return ""
-	}
-
-	texts := make([]pdf.Text, len(content.Text))
-	copy(texts, content.Text)
-	sort.Slice(texts, func(i, j int) bool {
-		if math.Abs(texts[i].Y-texts[j].Y) > 0.5 {
-			return texts[i].Y > texts[j].Y
-		}
-		return texts[i].X < texts[j].X
-	})
-
-	var b strings.Builder
-	lastY := texts[0].Y
-	// write first token if any
-	firstChunk := strings.TrimSpace(texts[0].S)
-	if firstChunk != "" {
-		b.WriteString(firstChunk)
-	}
-
-	for idx := 1; idx < len(texts); idx++ {
-		txt := texts[idx]
-		if math.Abs(lastY-txt.Y) > 0.5 {
-			b.WriteByte('\n')
-			// new line: write token directly
-			chunk := strings.TrimSpace(txt.S)
-			if chunk != "" {
-				b.WriteString(chunk)
-			}
-			// no gap-based spacing; nothing else to track
-		} else {
-			// Do not insert spaces based on gap heuristics; just append.
-			chunk := strings.TrimSpace(txt.S)
-			if chunk != "" {
-				b.WriteString(chunk)
-			}
-		}
-		lastY = txt.Y
-	}
-
-	return b.String()
-}
