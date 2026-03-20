@@ -1,83 +1,61 @@
-# NvReader
+# NvReader - Professional TUI PDF Reader
 
-NvReader is a terminal PDF reader built with Bubble Tea. It keeps page boundaries strict (one rendered page at a time), supports Vim-like navigation, and includes a command palette and help panel.
+A high-performance Terminal User Interface (TUI) for reading PDF documents with a focus on typography, readability, and speed.
 
-## Requirements
+## ✨ Key Features
 
-- Go 1.25+
+- **🚀 Instant Startup (Async Loading)**: Launches immediately using background ingestion. No more waiting for large PDFs to parse.
+- **📡 Td/Tm Radar Extraction**: Uses a low-level PDF stream interpreter to accurately detect line breaks and preserve word integrity (e.g., compound words like `object-oriented`).
+- **📖 Semantic Paragraphing**: Automatically reconstructs paragraphs from fragmented PDF lines for a natural reading flow.
+- **🧲 Punctuation Glue**: Anchors symbols (`, . ! ?`) to their preceding words to prevent orphaned wraps.
+- **🔍 Global Search**: Lightning-fast cross-page search with dynamic highlighting.
+- **🌗 Multi-File Support**: Open or switch between PDF files within the app using `:open` or `Ctrl+P`.
 
-## Run
+## ⌨️ Shortcuts & Commands
 
-```bash
-go run . "path/to/file.pdf"
-```
+### Navigation
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Scroll line down / up |
+| `J` / `K` | Next / Previous PAGE |
+| `PgDn` / `PgUp` | Next / Previous PAGE |
+| `/` | Enter SEARCH mode |
+| `n` / `N` | Next / Previous search match |
+| `?` | Toggle HELP panel |
 
-Windows example:
+### Commands (Press `:`)
+| Command | Action |
+| --- | --- |
+| `:open <path>` | Open a NEW PDF document |
+| `:goto <n>` | Jump to page `n` |
+| `:export` | Save the current page as a `.txt` file |
+| `:q` / `:quit` | Exit the application |
 
-```bash
-go run . "C:\Users\you\Documents\book.pdf"
-```
+### Global
+| Key | Action |
+| --- | --- |
+| `Ctrl+P` | Quick-Open a new file |
+| `Ctrl+Q` | Secure Exit |
 
-## Navigation (Detailed)
+## 🛠️ Installation & Usage
 
-NvReader has two levels of navigation:
-
-1. In-page scrolling (moves inside the current page text).
-2. Page navigation (changes page index, for example 14/210 -> 15/210).
-
-### In-page scrolling
-
-- `j` or `Down`: move one line down in current page
-- `k` or `Up`: move one line up in current page
-
-### Page navigation
-
-- `J` or `Space`: next page
-- `K`: previous page
-- `PgDn` / `Av Pag`: next page
-- `PgUp` / `Re Pag`: previous page
-- `Ctrl+F`: next page
-- `Ctrl+B`: previous page
-
-Page navigation always keeps page boundaries. The app does not merge multiple pages into one scrolling buffer during normal reading.
-
-## Command Mode
-
-Press `:` to open command mode and type one of these commands:
-
-- `help` (aliases: `commands`, `tools`, `?`, `:help`): open help panel
-- `goto <n>`: jump to page `n`
-- `search <term>`: search term across all pages
-- `export`: export current page to `export_page_<n>.txt`
-
-### Search flow
-
-1. Press `/` (prefills command with `search `).
-2. Type term and press `Enter`.
-3. Use `n` and `N` to jump between matches.
-
-## Quick keys
-
-- `?`: toggle help panel
-- `Esc`: close help panel or cancel command mode
-- `q` or `Ctrl+C`: quit
-
-## Text extraction and quality notes
-
-PDF extraction is inherently imperfect because many PDFs encode text as positioned glyphs, not as plain logical paragraphs. To improve quality while preserving page boundaries, NvReader uses strict per-page fallback order:
-
-1. `GetPlainText(nil)` for that page
-2. `GetTextByRow()` for that page
-3. `Content().Text` for that page
-
-The app does not justify or aggressively reflow text anymore, to avoid breaking words. Depending on the source PDF generator, some pages can still contain minor artifacts, but page boundaries remain strict.
-
-## Tests
+Requires [Go](https://golang.org/) 1.18+.
 
 ```bash
-go test ./...
+# Clone and run
+go run . "path/to/your/document.pdf"
+
+# Run without path to start in the Welcome Screen
+go run .
 ```
 
-## License
+## 🏗️ Technical Architecture
 
-See `LICENSE`.
+NvReader is built using:
+- **[Bubbletea](https://github.com/charmbracelet/bubbletea)**: For the TUI event loop and concurrency.
+- **[Lipgloss](https://github.com/charmbracelet/lipgloss)**: For professional-grade terminal styling.
+- **[dslipak/pdf](https://github.com/dslipak/pdf)**: For low-level PDF stream access.
+- **Custom Post-Processor**: An NLP-lite engine that cleans up extraction artifacts while preserving semantic meaning.
+
+---
+*Created with focus on visual excellence and developer experience.*

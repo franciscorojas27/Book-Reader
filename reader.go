@@ -27,8 +27,12 @@ import (
 	"sync"
 	"unicode"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/dslipak/pdf"
 )
+
+type pdfLoadedMsg *pageCache
+type errorMsg error
 
 /*
 pageCache holds lazily-loaded page text to guarantee the application 
@@ -104,6 +108,16 @@ func loadPages(path string) (*pageCache, error) {
 		return nil, err
 	}
 	return newPageCache(r), nil
+}
+
+func loadPDF(path string) tea.Cmd {
+	return func() tea.Msg {
+		cache, err := loadPages(path)
+		if err != nil {
+			return errorMsg(err)
+		}
+		return pdfLoadedMsg(cache)
+	}
 }
 
 /*
