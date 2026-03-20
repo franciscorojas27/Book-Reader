@@ -70,10 +70,10 @@ func extractPageText(pg pdf.Page) (string, error) {
 	contentText := sanitizeExtractedText(contentToText(pg))
 
 	best := chooseBestPageText(plainText, rowText, contentText)
-	// Convert page to a compact block: remove intra-token spaces so the
-	// text is a continuous block, but ensure punctuation (.,;:!?) is
-	// followed by a single space when followed by a letter/number.
-	best = blockNormalize(best)
+	// Apply a simple, pattern-based cleanup: collapse long runs of single
+	// letters separated by spaces (e.g. "F o r m a n y" -> "Formany"),
+	// remove spaces before punctuation and ensure one space after.
+	best = simpleFixSpaces(best)
 	if strings.TrimSpace(best) != "" {
 		return best, nil
 	}
@@ -264,26 +264,6 @@ func simpleFixSpaces(s string) string {
 	lines := strings.Split(s, "\n")
 	for i := range lines {
 		lines[i] = strings.TrimSpace(lines[i])
-	}
-	return strings.Join(lines, "\n")
-}
-
-// blockNormalize collapses spaces within lines (concatenates tokens)
-// and then ensures punctuation is followed by a single space when
-// immediately followed by a letter or digit. Newlines are preserved.
-func blockNormalize(s string) string {
-	if strings.TrimSpace(s) == "" {
-		return s
-	}
-	reAfter := regexp.MustCompile(`([,.;:!?])([\p{L}\p{N}])`)
-	lines := strings.Split(s, "\n")
-	for i, line := range lines {
-		// remove spaces and tabs inside the line
-		l := strings.ReplaceAll(line, " ", "")
-		l = strings.ReplaceAll(l, "\t", "")
-		// ensure one space after punctuation when followed by letter/number
-		l = reAfter.ReplaceAllString(l, "$1 $2")
-		lines[i] = strings.TrimSpace(l)
 	}
 	return strings.Join(lines, "\n")
 }
