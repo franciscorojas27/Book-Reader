@@ -1,3 +1,20 @@
+/*
+DEV LOG - TUI ARCHITECTURE & FLOW RENDERING
+-------------------------------------------------------------------------------
+The TUI (Terminal User Interface) manages the visual flow of extracted PDF data.
+
+Key architectural decisions:
+1. Viewport State: Every frame is passed to m.viewport.Update(msg) to handle
+   internal scrolling state and terminal resize event buffering.
+2. Semantic Flow Packaging: To improve readability on varying terminal widths,
+   wrapText reconstructions paragraphs by joining the fragmented PDF lines.
+3. Smart Paragraphing: We insert a paragraph break (double newline) 
+   approximately every 10 lines upon hitting a sentence-ending punctuation
+   (., !, ?), ensuring the text is visually digestible.
+4. Punctuation Glue: Commas and periods are forcibly attached to their 
+   preceding word to prevent orphaned symbols at the start of new lines.
+-------------------------------------------------------------------------------
+*/
 package main
 
 import (
@@ -63,6 +80,15 @@ func (m pdfModel) Init() tea.Cmd {
 }
 
 func (m pdfModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var (
+		cmd  tea.Cmd
+		cmds []tea.Cmd
+	)
+
+	// CRITICAL: Viewport must receive all messages.
+	m.viewport, cmd = m.viewport.Update(msg)
+	cmds = append(cmds, cmd)
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		height := msg.Height - headerHeight - footerHeight
@@ -77,7 +103,8 @@ func (m pdfModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.Height = height
 		m.refreshPage()
 		m.viewport.GotoTop()
-		return m, nil
+		return m, tea.Batch(cmds...)
+
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC || msg.String() == "q" {
 			return m, tea.Quit
@@ -87,18 +114,21 @@ func (m pdfModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showHelp = false
 				m.mode = "NORMAL"
 				m.statusMessage = "Help closed"
-				return m, nil
+				return m, tea.Batch(cmds...)
 			}
 		}
 		if m.commandMode {
-			return m.handleCommandMode(msg)
+			resModel, resCmd := m.handleCommandMode(msg)
+			return resModel, tea.Batch(append(cmds, resCmd)...)
 		}
-		return m.handleNavigation(msg)
+		resModel, resCmd := m.handleNavigation(msg)
+		return resModel, tea.Batch(append(cmds, resCmd)...)
 	}
-	return m, nil
+
+	return m, tea.Batch(cmds...)
 }
 
-func (m pdfModel) handleCommandMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m pdfModel) handleCommandMode(msg tea.KeyMsg) (pdfModel, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEsc:
 		m.commandMode = false
@@ -193,7 +223,7 @@ func (m *pdfModel) exportPage() {
 	m.statusMessage = fmt.Sprintf("Exported page %d to %s", m.currentPage, file)
 }
 
-func (m *pdfModel) handleNavigation(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m pdfModel) handleNavigation(msg tea.KeyMsg) (pdfModel, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyPgDown:
 		m.nextPage()
@@ -301,9 +331,7 @@ func (m *pdfModel) prevMatch() {
 
 /*
 refreshPage pulls the resolved textual data for the actively focused page
-and synchronously mounts it into the terminal viewport bounds. 
-It optionally injects dynamic highlights for active searches and invokes
-the line-wrapping sub-routine to preserve readability margins.
+and synchronously mounts it into the terminal viewport bounds.
 */
 func (m *pdfModel) refreshPage() {
 	if m.totalPages == 0 {
@@ -317,11 +345,7 @@ func (m *pdfModel) refreshPage() {
 		m.currentPage = m.totalPages
 	}
 	content := m.cache.get(m.currentPage)
-	/*
-	   Background pre-fetching buffer.
-	   Triggering preloadAround ensures seamless reading transitions 
-	   by mounting surrounding pages into the thread-safe map preemptively.
-	*/
+	
 	m.cache.preloadAround(m.currentPage, 3)
 
 	if m.searchTerm != "" {
@@ -337,81 +361,69 @@ func (m *pdfModel) refreshPage() {
 	m.viewport.SetContent(content)
 }
 
-/*
-wrapText applies word wrapping to ensure the extracted PDF paragraph fits seamlessly
-within the boundaries of the terminal viewport.
-It performs a hard wrap on maxWidth boundaries, and fully justifies the lines 
-by inserting mathematically distributed padding spaces between words. 
-The final line of any paragraph natively retains its standard left alignment.
-*/
 func wrapText(s string, maxWidth int) string {
 	if s == "" || maxWidth <= 0 {
 		return s
 	}
 
-	var out []string
-	paragraphs := strings.Split(s, "\n")
-	
-	for _, p := range paragraphs {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			out = append(out, "")
-			continue
-		}
+	// Step 1: Flatten everything into words. 
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return ""
+	}
 
-		words := strings.Fields(p)
-		var currentLine []string
-		var currentLineLen int
-
-		for _, word := range words {
-			wordLen := len([]rune(word))
-			
-			if len(currentLine) > 0 && currentLineLen+len(currentLine)+wordLen > maxWidth {
-				out = append(out, justifyLine(currentLine, currentLineLen, maxWidth))
-				currentLine = []string{word}
-				currentLineLen = wordLen
-			} else {
-				currentLine = append(currentLine, word)
-				currentLineLen += wordLen
-			}
-		}
-
-		if len(currentLine) > 0 {
-			out = append(out, strings.Join(currentLine, " "))
+	// Step 2: Glue orphaned punctuation to the previous word.
+	var words []string
+	for _, f := range fields {
+		if len(words) > 0 && (f == "," || f == "." || f == ":" || f == ";" || f == "!" || f == "?") {
+			words[len(words)-1] += f
+		} else {
+			words = append(words, f)
 		}
 	}
 
-	return strings.Join(out, "\n")
-}
+	var out strings.Builder
+	var currentLine strings.Builder
+	lineCount := 0
 
-/*
-justifyLine computes the exact gap frequency required to distribute excess 
-blank columns smoothly across the line, producing a perfectly flush right margin.
-*/
-func justifyLine(words []string, wordsLen int, maxWidth int) string {
-	if len(words) == 1 {
-		return words[0]
-	}
-
-	totalSpaces := maxWidth - wordsLen
-	gaps := len(words) - 1
-
-	spacesPerGap := totalSpaces / gaps
-	extraSpaces := totalSpaces % gaps
-
-	var builder strings.Builder
-	for i, word := range words {
-		builder.WriteString(word)
-		if i < gaps {
-			spacesToApply := spacesPerGap
-			if i < extraSpaces {
-				spacesToApply++
-			}
-			builder.WriteString(strings.Repeat(" ", spacesToApply))
+	flushCurrent := func() {
+		if currentLine.Len() > 0 {
+			out.WriteString(strings.TrimSpace(currentLine.String()))
+			out.WriteByte('\n')
+			currentLine.Reset()
+			lineCount++
 		}
 	}
 
-	return builder.String()
+	for _, word := range words {
+		wordLen := len([]rune(word))
+		
+		// Normal wrap check.
+		if currentLine.Len() > 0 && currentLine.Len()+1+wordLen > maxWidth {
+			flushCurrent()
+		}
+
+		if currentLine.Len() > 0 {
+			currentLine.WriteByte(' ')
+		}
+		currentLine.WriteString(word)
+
+		// Semantic Paragraph Break check:
+		// If we've committed ~10 lines and just finished a sentence, flush it 
+		// and add a double newline to start a clean new paragraph.
+		if lineCount >= 10 && (strings.HasSuffix(word, ".") || strings.HasSuffix(word, "!") || strings.HasSuffix(word, "?")) {
+			flushCurrent()
+			out.WriteByte('\n')
+			lineCount = 0
+		}
+	}
+
+	// Final flush.
+	if currentLine.Len() > 0 {
+		out.WriteString(strings.TrimSpace(currentLine.String()))
+	}
+
+	return out.String()
 }
 
 func (m pdfModel) View() string {
@@ -464,7 +476,7 @@ func shortenPath(path string, max int) string {
 }
 
 /*
-findMatches executes a lazy-loaded linear scan over all strictly indexed 
+findMatches executes a lazy-loaded linear scan over all strictly indexed
 document pages to isolate sub-string hits.
 */
 func (m *pdfModel) findMatches(term string) []int {

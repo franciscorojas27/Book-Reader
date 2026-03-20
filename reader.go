@@ -1,5 +1,24 @@
 package main
 
+/*
+DEV LOG - PDF EXTRACTION ENGINE (Td/Tm Radar)
+-------------------------------------------------------------------------------
+The extraction engine solves the "missing spaces" problem in justified PDFs.
+
+Key technical breakthroughs:
+1. Stream Interception: Instead of using GetPlainText (which ignores kerning) 
+   or GetTextByRow (which fragments strings), we use pdf.Interpret to 
+   manually listen to the binary 'Contents' stream.
+2. The Td/Tm Discovery: In justified PDFs, "to design" might be split 
+   across lines. Standard extractors often merge the last word of one line 
+   with the first word of the next ("todesign"). By intercepting matrix 
+   movement (Td, TD, Tm), we detect vertical Y-axis jumps >1.0 and 
+   forcibly inject a newline. 
+3. This preserves word integrity without needing complex dictionary-based 
+   heuristics or font-metric estimators.
+-------------------------------------------------------------------------------
+*/
+
 import (
 	"fmt"
 	"math"
@@ -124,6 +143,7 @@ func extractPageText(pg pdf.Page) (string, error) {
 	}()
 
 	var lastY float64 = -9999
+	isFirst := true
 
 	pdf.Interpret(strm, func(stk *pdf.Stack, op string) {
 		n := stk.Len()
@@ -134,7 +154,10 @@ func extractPageText(pg pdf.Page) (string, error) {
 
 		switch op {
 		case "T*":
-			b.WriteByte('\n')
+			if !isFirst {
+				b.WriteByte('\n')
+			}
+			isFirst = false
 		case "Tf":
 			if len(args) == 2 {
 				f := args[0].Name()
@@ -146,13 +169,19 @@ func extractPageText(pg pdf.Page) (string, error) {
 			}
 		case "\"":
 			if len(args) == 3 {
-				b.WriteByte('\n')
+				if !isFirst {
+					b.WriteByte('\n')
+				}
 				showText(args[2].RawString())
+				isFirst = false
 			}
 		case "'":
 			if len(args) == 1 {
-				b.WriteByte('\n')
+				if !isFirst {
+					b.WriteByte('\n')
+				}
 				showText(args[0].RawString())
+				isFirst = false
 			}
 		case "Td", "TD":
 			/*
@@ -162,10 +191,11 @@ func extractPageText(pg pdf.Page) (string, error) {
 			*/
 			if len(args) == 2 {
 				ty := args[1].Float64()
-				if math.Abs(ty) > 1.0 {
+				if !isFirst && math.Abs(ty) > 1.0 {
 					b.WriteByte('\n')
 				}
 			}
+			isFirst = false
 		case "Tm":
 			/*
 			   Tm: Absolute matrix translation overrides.
@@ -174,15 +204,17 @@ func extractPageText(pg pdf.Page) (string, error) {
 			*/
 			if len(args) == 6 {
 				ty := args[5].Float64()
-				if lastY != -9999 && math.Abs(ty-lastY) > 1.0 {
+				if !isFirst && lastY != -9999 && math.Abs(ty-lastY) > 1.0 {
 					b.WriteByte('\n')
 				}
 				lastY = ty
 			}
+			isFirst = false
 		case "Tj":
 			if len(args) == 1 {
 				showText(args[0].RawString())
 			}
+			isFirst = false
 		case "TJ":
 			if len(args) > 0 {
 				v := args[0]
@@ -193,6 +225,7 @@ func extractPageText(pg pdf.Page) (string, error) {
 					}
 				}
 			}
+			isFirst = false
 		}
 	})
 
@@ -205,17 +238,8 @@ func extractPageText(pg pdf.Page) (string, error) {
 
 	/*
 	   NLP Post-Processing
-	   Despite tracking direct physical coordinates, some PDFs encode native
-	   missing spaces in formatting elements missing tracking boundaries.
-	   Conservatively slicing boundaries like numbers and hyphenations preserves
-	   the aesthetic flow natively.
+	   Normalization focuses on punctuation and redundant spacing. 
 	*/
-	reHyphen := regexp.MustCompile(`([a-z]+)-\n([a-z]+)`)
-	text = reHyphen.ReplaceAllString(text, "$1$2\n")
-
-	reCamel := regexp.MustCompile(`([a-z])([A-Z])`)
-	text = reCamel.ReplaceAllString(text, "$1 $2")
-
 	reLetterNum := regexp.MustCompile(`([a-zA-Z])([0-9])`)
 	text = reLetterNum.ReplaceAllString(text, "$1 $2")
 	
@@ -226,8 +250,6 @@ func extractPageText(pg pdf.Page) (string, error) {
 
 	return text, nil
 }
-
-
 
 func sanitizeExtractedText(s string) string {
 	if s == "" {
@@ -247,27 +269,26 @@ func sanitizeExtractedText(s string) string {
 	return b.String()
 }
 
-
-
-// simpleFixSpaces applies a small set of deterministic regex rules to clean up
-// common PDF extraction artifacts.
+/*
+simpleFixSpaces applies deterministic regex rules (NLP) to clean up 
+remnant PDF extraction artifacts.
+*/
 func simpleFixSpaces(s string) string {
 	if strings.TrimSpace(s) == "" {
 		return s
 	}
 
-	// Collapse runs of 3 or more single letters (e.g. "T a l e n t").
-	// Using 3+ letters is much safer to avoid squashing valid single-letter words.
+	// Collapse orphaned letters (T a l e n t -> Talent)
 	reSpaced := regexp.MustCompile(`(?i)(?:\b[A-Za-z]\s+){2,}[A-Za-z]\b`)
 	s = reSpaced.ReplaceAllStringFunc(s, func(m string) string {
 		return strings.ReplaceAll(m, " ", "")
 	})
 
-	// Remove spaces before punctuation
-	reBefore := regexp.MustCompile(`\s+([,.;:!?])`)
+	// CRITICAL FIX: Eliminate ALL whitespace (including newlines) BEFORE punctuation.
+	reBefore := regexp.MustCompile(`(?m)\s+([,.;:!?])`)
 	s = reBefore.ReplaceAllString(s, "$1")
 
-	// Ensure one space after punctuation if immediately followed by a letter/number
+	// Ensure one space after punctuation
 	reAfter := regexp.MustCompile(`([,.;:!?])(\S)`)
 	s = reAfter.ReplaceAllString(s, "$1 $2")
 
@@ -275,12 +296,5 @@ func simpleFixSpaces(s string) string {
 	reMulti := regexp.MustCompile(`\s{2,}`)
 	s = reMulti.ReplaceAllString(s, " ")
 
-	// Trim spaces at line ends and rebuild lines
-	lines := strings.Split(s, "\n")
-	for i := range lines {
-		lines[i] = strings.TrimSpace(lines[i])
-	}
-	return strings.Join(lines, "\n")
+	return strings.TrimSpace(s)
 }
-
-
