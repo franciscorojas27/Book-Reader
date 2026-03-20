@@ -89,16 +89,15 @@ func extractPageText(pg pdf.Page) (string, error) {
 func rowsToText(rows pdf.Rows) string {
 	var b strings.Builder
 	for i, row := range rows {
-		toks := make([]string, 0, len(row.Content))
 		for _, word := range row.Content {
+			// Do not insert spaces based on gap heuristics; simply
+			// concatenate tokens. We'll apply simple punctuation-based
+			// spacing later to ensure commas/periods are followed by a space.
 			chunk := strings.TrimSpace(word.S)
 			if chunk == "" {
 				continue
 			}
-			toks = append(toks, chunk)
-		}
-		if len(toks) > 0 {
-			b.WriteString(strings.Join(toks, " "))
+			b.WriteString(chunk)
 		}
 		if i < len(rows)-1 {
 			b.WriteByte('\n')
@@ -304,7 +303,6 @@ func contentToText(pg pdf.Page) string {
 	if firstChunk != "" {
 		b.WriteString(firstChunk)
 	}
-	prevChunk := firstChunk
 
 	for idx := 1; idx < len(texts); idx++ {
 		txt := texts[idx]
@@ -314,18 +312,13 @@ func contentToText(pg pdf.Page) string {
 			chunk := strings.TrimSpace(txt.S)
 			if chunk != "" {
 				b.WriteString(chunk)
-				prevChunk = chunk
 			}
 			// no gap-based spacing; nothing else to track
 		} else {
 			// Do not insert spaces based on gap heuristics; just append.
 			chunk := strings.TrimSpace(txt.S)
 			if chunk != "" {
-				if prevChunk != "" {
-					b.WriteByte(' ')
-				}
 				b.WriteString(chunk)
-				prevChunk = chunk
 			}
 		}
 		lastY = txt.Y
